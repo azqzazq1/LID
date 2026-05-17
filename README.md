@@ -24,6 +24,7 @@
   <img src="https://img.shields.io/badge/AppArmor-BYPASSED-DC3545?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Audit_Log-INVISIBLE-000000?style=for-the-badge" />
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
+  <a href="https://doi.org/10.5281/zenodo.20257645"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.20257645.svg" height="28" /></a>
 </p>
 
 <p align="center">
