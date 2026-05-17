@@ -19,145 +19,118 @@
 <br>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Linux-6.8+-0078D4?style=for-the-badge&logo=linux&logoColor=white" />
-  <img src="https://img.shields.io/badge/eBPF-kprobe-F36D00?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/AppArmor-BYPASSED-DC3545?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Linux-5.18+-0078D4?style=for-the-badge&logo=linux&logoColor=white" />
+  <img src="https://img.shields.io/badge/LSM-BYPASSED-DC3545?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Findings-3_Vectors-F36D00?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Audit_Log-INVISIBLE-000000?style=for-the-badge" />
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
   <a href="https://doi.org/10.5281/zenodo.20257645"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.20257645.svg" height="28" /></a>
 </p>
 
 <p align="center">
-  <b>Bypassing AppArmor MAC policies via eBPF pathname rewriting</b><br>
-  <sub>Before the kernel even asks for permission.</sub>
+  <b>Systematic discovery of kernel code paths that bypass LSM security guarantees</b><br>
+  <sub>The gate was never breached. It was walked around.</sub>
 </p>
 
 ---
 
 <br>
 
-## The Problem
+## What is LID?
 
 The Linux Security Module framework has one core guarantee that has held for **20+ years**:
 
 > *Security modules can only **add** restrictions. They can never **remove** them.*
 
-The `call_int_hook` macro enforces this — it iterates every LSM and **short-circuits on the first denial**:
+This guarantee is correct. LID doesn't break it.
 
-```c
-hlist_for_each_entry(P, &security_hook_heads.FUNC, list) {
-    RC = P->hook.FUNC(__VA_ARGS__);
-    if (RC != 0)
-        break;    // first deny wins — game over
-}
-```
-
-No LSM — including BPF LSM — can undo another module's decision. The framework is sound.
-
-**LID doesn't break the framework. It doesn't even touch it.**
+**LID finds kernel code paths that bypass LSM hooks entirely** — subsystems that perform security-sensitive operations without consulting the LSM framework. The security check is correct. The problem is that the kernel never asks.
 
 <br>
 
-## The Technique
+## Findings
 
-LID attaches a BPF kprobe to `do_sys_openat2` — the kernel's internal file-open handler. Before the kernel copies the filename from userspace, LID rewrites it in user memory. AppArmor then checks the **rewritten** path, not the original.
-
-Combined with a hard link (same inode, different name), AppArmor sees an allowed path and grants access to the denied file's content.
-
-```
-                    ┌──────────────────────────────────────────────┐
-                    │              KERNEL SPACE                     │
-                    │                                              │
- ┌──────────┐      │  ┌────────────────────────────────────────┐  │
- │          │      │  │         do_sys_openat2                  │  │
- │  User    │ open │  │                                        │  │
- │  Process ├─────>│  │  ┌──────────────────────────────────┐  │  │
- │          │      │  │  │  ★ BPF KPROBE (LID)              │  │  │
- │          │      │  │  │                                  │  │  │
- │          │      │  │  │  1. Read user buffer             │  │  │
- │          │      │  │  │  2. Match "/secret/file"         │  │  │
- │          │      │  │  │  3. Rewrite → "/allowed/link"    │  │  │
- │          │      │  │  │                                  │  │  │
- │          │      │  │  └──────────────────────────────────┘  │  │
- │          │      │  │         │                              │  │
- │          │      │  │         ▼                              │  │
- │          │      │  │  copy_from_user(filename)              │  │
- │          │      │  │  ── sees rewritten path ──             │  │
- │          │      │  │         │                              │  │
- │          │      │  │         ▼                              │  │
- │          │      │  │  ┌──────────────────────────────────┐  │  │
- │          │      │  │  │  LSM: call_int_hook(file_open)   │  │  │
- │          │      │  │  │                                  │  │  │
- │          │      │  │  │  AppArmor checks "/allowed/link" │  │  │
- │          │      │  │  │  ──────────────────> ALLOW ✓     │  │  │
- │          │      │  │  │                                  │  │  │
- │          │      │  │  │  (never sees "/secret/file")     │  │  │
- │          │      │  │  └──────────────────────────────────┘  │  │
- │          │      │  │         │                              │  │
- │          │      │  │         ▼                              │  │
- │  fd ◄────┤      │  │  VFS opens inode (same data!)         │  │
- │  reads   │      │  │                                        │  │
- │  secret! │      │  └────────────────────────────────────────┘  │
- └──────────┘      │                                              │
-                    │  Audit log: (empty)                          │
-                    └──────────────────────────────────────────────┘
-```
-
-### Why AppArmor Falls
-
-AppArmor is **pathname-based** — not inode-based like SELinux. Two hard links to the same file are two completely different identities in AppArmor's world:
-
-```
-  /tmp/secret_test_file.txt   ─┐
-                                ├── same inode (4483), same data
-  /tmp/.aa_bypass_link        ─┘
-
-  AppArmor profile:
-    deny /tmp/secret_test_file.txt rw    ← blocks this path
-    /tmp/** r                             ← allows this path
-```
-
-Rewrite the path → bypass the rule → read the same data. **AppArmor was never defeated — it was deceived.**
+| ID | Vector | Target | What Happens |
+|:---|:---|:---|:---|
+| [**LID-001**](findings/lid-001-ebpf-pathname/) | eBPF kprobe pathname rewriting | AppArmor | kprobe rewrites filename before `copy_from_user` → AppArmor checks wrong path |
+| [**LID-002**](findings/lid-002-iouring-msgring/) | io_uring MSG_RING SEND_FD | SELinux, AppArmor, Smack | fd transfer skips `security_file_receive()` — every other fd transfer calls it |
+| [**LID-003**](findings/lid-003-mount-api/) | New mount API (fsopen/fsmount) | AppArmor | `security_sb_mount()` never called — AppArmor's only mount hook bypassed |
 
 <br>
 
-## Quick Start
+## The Pattern
+
+Every finding follows the same pattern:
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    THE LID PATTERN                          │
+  │                                                             │
+  │   Kernel Subsystem A               LSM Framework            │
+  │   (eBPF / io_uring / mount API)    (AppArmor / SELinux)     │
+  │                                                             │
+  │   ┌───────────────────┐                                     │
+  │   │ Performs operation │──── should call ──── security_*()   │
+  │   │ or manipulates    │          but                        │
+  │   │ security input    │     DOESN'T  ██                     │
+  │   └───────────────────┘                                     │
+  │                                                             │
+  │   The LSM framework is correct.                             │
+  │   The kernel just doesn't always use it.                    │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+Two kernel subsystems. Incompatible trust assumptions. One gap.
+
+<br>
+
+---
+
+## LID-001: eBPF Pathname Rewriting
+
+**The flagship finding.** A BPF kprobe on `do_sys_openat2` rewrites the filename in user memory before the kernel copies it. AppArmor checks the rewritten path, grants access. Zero audit trace.
+
+```
+  process: open("/tmp/secret.txt")
+       │
+       ▼
+  do_sys_openat2()
+       │
+    ★ LID kprobe fires here
+    │  bpf_probe_write_user()
+    │  rewrites "/tmp/secret.txt" → "/tmp/.bypass_link"
+       │
+       ▼
+  getname_flags()          ← kernel copies the (rewritten) path
+       │
+       ▼
+  security_file_open()     ← LSM hooks check "/tmp/.bypass_link"
+       │                      AppArmor: ALLOW ✓
+       ▼
+  VFS opens inode          ← same file content (hard link)
+       │
+       ▼
+  return fd to process     ← success, zero audit trace
+```
+
+### Quick Start
 
 ```bash
-# 1. Check system requirements
 sudo ./scripts/check_prerequisites.sh
-
-# 2. Install dependencies & generate vmlinux.h
 sudo ./scripts/setup_env.sh
-
-# 3. Build LID
 make
-
-# 4. Set up demo (AppArmor profile, test file, hard link)
 sudo ./scripts/setup_demo.sh
-
-# 5. Run the full demonstration
 sudo ./scripts/run_demo.sh
 ```
 
-<br>
-
-## Demo
+### Demo Output
 
 ```
-  ██╗     ██╗██████╗
-  ██║     ██║██╔══██╗        Linux Integrity Drift
-  ██║     ██║██║  ██║        Full Demonstration
-  ██║     ██║██║  ██║
-  ███████╗██║██████╔╝        "Linux is Dying"
-  ╚══════╝╚═╝╚═════╝
-
 ╔══════════════════════════════════════════════════════════╗
 ║  Phase 1: AppArmor ENFORCING — access should be DENIED   ║
 ╚══════════════════════════════════════════════════════════╝
 
   $ /tmp/test_reader
-  [*] Attempting to read /tmp/secret_test_file.txt
   [-] DENIED: open() failed: Permission denied (errno=13)
 
 ╔══════════════════════════════════════════════════════════╗
@@ -165,19 +138,13 @@ sudo ./scripts/run_demo.sh
 ╚══════════════════════════════════════════════════════════╝
 
   [*] BPF kprobe attached to do_sys_openat2
-  [*] Target: /tmp/secret_test_file.txt → /tmp/.aa_bypass_link
 
 ╔══════════════════════════════════════════════════════════╗
 ║  Phase 3: With LID active — access should be GRANTED      ║
 ╚══════════════════════════════════════════════════════════╝
 
   $ /tmp/test_reader
-  [*] Attempting to read /tmp/secret_test_file.txt
   [+] SUCCESS: Read 44 bytes: SECRET_DATA=this_is_protected_content_12345
-
-  [BYPASS] pid=518899 comm=test_reader
-           original:  /tmp/secret_test_file.txt
-           rewritten: /tmp/.aa_bypass_link
 
 ╔══════════════════════════════════════════════════════════╗
 ║  Phase 4: Stealth check — audit log inspection             ║
@@ -185,22 +152,61 @@ sudo ./scripts/run_demo.sh
 
   $ dmesg | grep apparmor | grep DENIED
   (empty — no denial was ever generated)
-
-╔══════════════════════════════════════════════════════════╗
-║  Phase 5: Unloading LID — enforcement restored             ║
-╚══════════════════════════════════════════════════════════╝
-
-  $ /tmp/test_reader
-  [-] DENIED: open() failed: Permission denied (errno=13)
 ```
-
-**The bypass is selective, transparent, audit-invisible, and fully reversible.**
 
 <br>
 
-## Architecture Deep Dive
+---
 
-### The LSM Deadlock (Why BPF LSM Can't Help)
+## LID-002: io_uring MSG_RING Missing LSM Hook
+
+`IORING_OP_MSG_RING` with `IORING_MSG_SEND_FD` transfers file descriptors between io_uring rings **without calling `security_file_receive()`**. Every other fd transfer mechanism calls it:
+
+```
+  MSG_RING SEND_FD:    __io_fixed_fd_install()  ← NO security_file_receive()
+  FIXED_FD_INSTALL:    receive_fd()             ← security_file_receive() ✓
+  SCM_RIGHTS:          receive_fd()             ← security_file_receive() ✓
+  binder:              security_binder_transfer_file()                    ✓
+```
+
+**Bug location:** `io_uring/msg_ring.c`, `io_msg_install_complete()` — calls `__io_fixed_fd_install()` directly, skipping the LSM hook.
+
+**Verified with ftrace:** `security_file_receive` fires for SCM_RIGHTS but not for MSG_RING.
+
+**Affected:** Linux 5.18+ through v7.1-rc3 (unfixed as of 2026-05-17).
+
+**PoC:** [`findings/lid-002-iouring-msgring/msg_ring_bypass.c`](findings/lid-002-iouring-msgring/)
+
+<br>
+
+---
+
+## LID-003: New Mount API Bypasses AppArmor
+
+The new mount API (`fsopen` + `fsconfig` + `fsmount` + `move_mount`) **never calls `security_sb_mount()`** — the only mount hook AppArmor implements.
+
+```
+  OLD API:  mount("proc", "/mnt", "proc", 0, NULL)
+            → security_sb_mount()  → AppArmor: DENY ✗
+
+  NEW API:  fsopen("proc") → fsconfig(CMD_CREATE) → fsmount() → move_mount()
+            → security_sb_kern_mount()  → AppArmor: (not implemented) → ALLOW ✓
+```
+
+AppArmor registers **4** mount hooks. SELinux registers **14**. The new mount API uses hooks that only SELinux implements.
+
+Additional gaps found:
+- **`open_tree(OPEN_TREE_CLONE)`**: Zero security hooks — bypasses bind-mount policy
+- **`mount_setattr()`**: No LSM hook exists in the kernel at all
+- **`move_mount()` with detached mounts**: AppArmor sees NULL source path
+
+**Details:** [`findings/lid-003-mount-api/`](findings/lid-003-mount-api/)
+
+<br>
+
+---
+
+## Architecture: Why BPF LSM Can't Fix This
 
 ```
   LSM Hook Chain: call_int_hook(file_open, ...)
@@ -214,54 +220,70 @@ sudo ./scripts/run_demo.sh
                                          loop breaks
                                          RC = -EACCES
 
-  ─── If BPF is BEFORE AppArmor ───
-
-  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-  │  BPF LSM    │──>│  ...         │──>│  AppArmor    │
-  │  return 0   │   │              │   │  return -13  │
-  │  (allow)    │   │              │   │  (DENY) ██   │
-  └─────────────┘   └──────────────┘   └──────────────┘
-
-  BPF returns 0 → loop continues → AppArmor still denies
-  BPF returns -EACCES → can only ADD restrictions, not remove
-
-  ★ CONCLUSION: Within the LSM framework, there is NO position
-    where BPF can override AppArmor's denial. By design.
+  ★ The LSM framework is correct. No module can undo another's denial.
+  ★ LID operates OUTSIDE the framework — before hooks run, or where hooks don't exist.
 ```
-
-### LID's Approach: Go Around, Not Through
-
-```
-  SYSCALL: openat2("/secret/file")
-       │
-       ▼
-  ┌─────────────────────────────┐
-  │  do_sys_openat2()           │
-  │  ┌───────────────────────┐  │
-  │  │ ★ LID kprobe          │  │ ◄── BEFORE kernel copies the path
-  │  │ bpf_probe_write_user  │  │
-  │  │ "/secret" → "/link"   │  │
-  │  └───────────────────────┘  │
-  │       │                     │
-  │       ▼                     │
-  │  getname_flags()            │ ◄── kernel copies (rewritten) path
-  │       │                     │
-  │       ▼                     │
-  │  path_openat()              │
-  │       │                     │
-  │       ▼                     │
-  │  security_file_open()       │ ◄── LSM hooks check "/link" (allowed)
-  │       │                     │
-  │       ▼                     │
-  │  ✓ success                  │
-  └─────────────────────────────┘
-```
-
-**The kprobe fires before `copy_from_user`. The LSM framework never sees the original path.**
 
 <br>
 
-## Stealth Profile
+## Companion: SunnyDayBPF
+
+```
+                   ┌───────────────────────────────────────┐
+                   │          THE ATTACK TIMELINE           │
+                   │                                       │
+  Syscall Entry    │  ★ LID ─── manipulates input          │
+       │           │     (security check sees wrong data)  │
+       ▼           │                                       │
+  LSM Check        │     LSM allows (or never runs) ✓      │
+       │           │                                       │
+       ▼           │                                       │
+  Syscall Exit     │  ★ SunnyDayBPF ─── rewrites telemetry │
+       │           │     (monitoring sees wrong data)      │
+       ▼           │                                       │
+  Audit/Log        │     SIEM sees nothing ✓               │
+                   │                                       │
+                   │  Combined: ghost access                │
+                   └───────────────────────────────────────┘
+```
+
+<br>
+
+## Project Structure
+
+```
+LID/
+├── src/
+│   ├── bpf/
+│   │   └── lid.bpf.c              # BPF kprobe — pathname rewriter (LID-001)
+│   └── loader/
+│       └── lid_loader.c           # Userspace loader + event monitor
+├── findings/
+│   ├── lid-001-ebpf-pathname/     # eBPF pathname rewriting bypass
+│   ├── lid-002-iouring-msgring/   # io_uring MSG_RING missing LSM hook
+│   │   ├── msg_ring_bypass.c      # PoC with ftrace verification
+│   │   └── ADVISORY.md            # Technical advisory
+│   └── lid-003-mount-api/         # New mount API AppArmor bypass
+├── tests/
+│   └── test_reader.c              # Victim binary for LID-001 demo
+├── scripts/
+│   ├── check_prerequisites.sh     # Verify system requirements
+│   ├── setup_env.sh               # Install build dependencies
+│   ├── setup_demo.sh              # Create demo environment
+│   ├── run_demo.sh                # Run full LID-001 demonstration
+│   └── teardown.sh                # Clean up everything
+├── docs/
+│   └── RESEARCH.md                # Full technical research paper
+├── publish/                       # Articles for Medium, dev.to, etc.
+├── Makefile
+├── LICENSE
+├── SECURITY.md
+└── README.md
+```
+
+<br>
+
+## Stealth Profile (LID-001)
 
 | Indicator | Visibility | Notes |
 |:---|:---|:---|
@@ -273,35 +295,18 @@ sudo ./scripts/run_demo.sh
 
 <br>
 
-## Companion: SunnyDayBPF
+## Mitigations
 
-LID is the offensive counterpart to [**SunnyDayBPF**](https://github.com/azqzazq1/SunnyDayBPF):
-
-```
-                   ┌───────────────────────────────────────┐
-                   │          THE ATTACK TIMELINE           │
-                   │                                       │
-  Syscall Entry    │  ★ LID ─── rewrites path              │
-       │           │     (security check sees wrong path)  │
-       ▼           │                                       │
-  LSM Check        │     AppArmor allows ✓                 │
-       │           │                                       │
-       ▼           │                                       │
-  Syscall Exit     │  ★ SunnyDayBPF ─── rewrites telemetry │
-       │           │     (monitoring sees wrong data)      │
-       ▼           │                                       │
-  Audit/Log        │     Wazuh/auditd sees nothing ✓       │
-                   │                                       │
-                   │  Combined: ghost access                │
-                   └───────────────────────────────────────┘
-```
-
-| | SunnyDayBPF | LID |
+| Mitigation | Effectiveness | Tradeoff |
 |:---|:---|:---|
-| **When** | Post-syscall | Pre-LSM-check |
-| **What** | Telemetry data | Syscall arguments |
-| **Effect** | Blind the cameras | Bypass the gate |
-| **Combined** | Full ghost access | |
+| `kernel.lockdown=confidentiality` | Blocks BPF entirely | Kills legitimate monitoring |
+| Disable `bpf_probe_write_user` | Prevents LID-001 path rewrite | Requires kernel rebuild |
+| `fs.protected_hardlinks=1` | Limits hard link creation | Default on modern kernels |
+| Monitor `bpftool prog list` | Detects attached probes | Requires active polling |
+| Migrate to SELinux | Inode-based, defeats path rewriting | Complex migration |
+| Restrict io_uring | Blocks LID-002 | May break applications |
+
+For detailed mitigation guidance, see [`docs/RESEARCH.md`](docs/RESEARCH.md).
 
 <br>
 
@@ -309,51 +314,10 @@ LID is the offensive counterpart to [**SunnyDayBPF**](https://github.com/azqzazq
 
 | Requirement | Details |
 |:---|:---|
-| Kernel | 5.x+ with BPF support |
-| Config | `CONFIG_BPF_KPROBE_OVERRIDE=y` (Ubuntu default) |
-| Privileges | Root or `CAP_BPF` + `CAP_PERFMON` |
-| Target | AppArmor (pathname-based MAC) |
-| Path type | Writable user memory (stack/heap, not `.rodata`) |
-
-<br>
-
-## Project Structure
-
-```
-LID/
-├── src/
-│   ├── bpf/
-│   │   └── lid.bpf.c              # BPF kprobe — pathname rewriter
-│   └── loader/
-│       └── lid_loader.c           # Userspace loader + event monitor
-├── tests/
-│   └── test_reader.c              # Victim binary for demonstration
-├── scripts/
-│   ├── check_prerequisites.sh     # Verify system requirements
-│   ├── setup_env.sh               # Install build dependencies
-│   ├── setup_demo.sh              # Create demo environment
-│   ├── run_demo.sh                # Run full demonstration
-│   └── teardown.sh                # Clean up everything
-├── docs/
-│   └── RESEARCH.md                # Full technical research paper
-├── Makefile
-├── LICENSE
-└── README.md
-```
-
-<br>
-
-## Mitigations
-
-| Mitigation | Effectiveness | Tradeoff |
-|:---|:---|:---|
-| `kernel.lockdown=confidentiality` | Blocks BPF entirely | Kills legitimate monitoring |
-| Disable `bpf_probe_write_user` | Prevents path rewrite | Requires kernel rebuild |
-| `fs.protected_hardlinks=1` | Limits hard link creation | Default on modern kernels |
-| Monitor `bpftool prog list` | Detects attached probes | Requires active polling |
-| BPF LSM self-protection | Block kprobes on VFS functions | Complex to implement |
-
-For detailed mitigation guidance, see [`docs/RESEARCH.md`](docs/RESEARCH.md).
+| Kernel | 5.x+ with BPF support (LID-001), 5.18+ (LID-002) |
+| Config | `CONFIG_BPF_KPROBE_OVERRIDE=y` for LID-001 |
+| Privileges | Root or `CAP_BPF` + `CAP_PERFMON` (LID-001), unprivileged (LID-002) |
+| Target | AppArmor (LID-001, LID-003), any LSM (LID-002) |
 
 <br>
 
