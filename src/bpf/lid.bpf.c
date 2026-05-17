@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
-// BPF LSM Policy Override - AppArmor Bypass via Pathname Rewriting
+// SPDX-License-Identifier: MIT
+// LID — Linux Integrity Drift
+// AppArmor Bypass via eBPF Pathname Rewriting
 // Author: Azizcan Daştan (Milenium Security)
 //
 // Attack: Rewrites user-space filename in openat2() before AppArmor checks it.

@@ -23,7 +23,7 @@
   <img src="https://img.shields.io/badge/eBPF-kprobe-F36D00?style=for-the-badge" />
   <img src="https://img.shields.io/badge/AppArmor-BYPASSED-DC3545?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Audit_Log-INVISIBLE-000000?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/License-GPL_v2-blue?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
 </p>
 
 <p align="center">
