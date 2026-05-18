@@ -48,6 +48,93 @@ This guarantee is correct. LID doesn't break it.
 
 <br>
 
+## Understanding What LID Is (and Isn't)
+
+Each finding has two distinct dimensions that should not be conflated:
+
+### A) Policy Visibility Gap
+
+The architectural blind spot. The question is not "can an attacker exploit this?" but:
+
+- What does AppArmor/SELinux actually **see**?
+- What does the audit log **record**?
+- What does your SIEM/EDR **observe**?
+- What does the policy engine **think** happened?
+
+If a security-sensitive operation occurs and the enforcement layer never even evaluates it, you have a visibility gap — regardless of whether an attacker can practically abuse it today. This matters for **compliance**, **forensics**, and **defense-in-depth assumptions**.
+
+### B) Practical Escalation Path
+
+The real-world exploitability question:
+
+- Does this cross a privilege boundary?
+- Does an attacker need existing root/CAP_BPF to trigger it?
+- Is an exploit chain required, or is it standalone?
+- What is the actual impact — data access, privilege escalation, policy evasion?
+
+**These two things are different.** A finding can be a critical visibility gap (your monitoring is blind) without being a practical privilege escalation (attacker already needs root). Conversely, a finding can be a direct escalation path with minimal prerequisites.
+
+| Finding | Visibility Gap | Practical Escalation |
+|:---|:---|:---|
+| **LID-001** | **Critical** — AppArmor sees nothing, audit log empty, zero forensic trace | **Limited** — requires root or CAP_BPF+CAP_PERFMON (already privileged). Not a privilege escalation. Impact: policy evasion + audit blindness. |
+| **LID-002** | **High** — `security_file_receive()` never fires, fd transfer invisible to all LSMs | **High** — works from **unprivileged** userspace via io_uring. Crosses LSM enforcement boundary without any privilege. |
+| **LID-003** | **High** — `security_sb_mount()` bypassed, AppArmor mount policy is dead code | **Medium** — requires mount namespace access (CAP_SYS_ADMIN in user ns). Available in many container configs. |
+
+<br>
+
+## Reproducibility Matrix
+
+Each finding has specific kernel/config/privilege requirements. **If your environment doesn't match, the finding will not reproduce.**
+
+### LID-001: eBPF Pathname Rewriting
+
+| Condition | Required | Notes |
+|:---|:---|:---|
+| Kernel version | 5.x+ | Tested on 5.15, 6.1, 6.6, 6.8 |
+| `CONFIG_BPF_SYSCALL` | `=y` | Default on all major distros |
+| `CONFIG_BPF_KPROBE_OVERRIDE` | `=y` | Ubuntu/Debian enable it, **RHEL does not** |
+| `CONFIG_SECURITY_APPARMOR` | `=y` | Target LSM must be AppArmor |
+| AppArmor profile | Enforcing, deny rule on target path | Works with any path-based deny rule |
+| Privileges | `root` or `CAP_BPF` + `CAP_PERFMON` | **Cannot run unprivileged** |
+| `kernel.lockdown` | `none` or `integrity` | `confidentiality` mode blocks kprobe attach |
+| `kernel.unprivileged_bpf_disabled` | Irrelevant | Requires CAP_BPF regardless |
+| `fs.protected_hardlinks` | `0` for cross-user links | `1` (default) still allows same-user hard links |
+| SELinux instead of AppArmor | **Does not work** | SELinux is inode-based, not pathname-based |
+
+### LID-002: io_uring MSG_RING
+
+| Condition | Required | Notes |
+|:---|:---|:---|
+| Kernel version | 6.0+ | `IORING_MSG_SEND_FD` added in 6.0 |
+| `CONFIG_IO_URING` | `=y` | Default on all major distros |
+| Privileges | **None** | Works from unprivileged userspace |
+| `io_uring_disabled` sysctl | `0` (default) | `2` blocks unprivileged, `1` blocks all |
+| Target LSM | Any (SELinux, AppArmor, Smack) | `security_file_receive()` is a generic LSM hook |
+| `kernel.lockdown` | Irrelevant | No BPF involved |
+
+### LID-003: New Mount API
+
+| Condition | Required | Notes |
+|:---|:---|:---|
+| Kernel version | 5.2+ | `fsopen`/`fsmount` introduced in 5.2 |
+| `CONFIG_SECURITY_APPARMOR` | `=y` | Only AppArmor is affected |
+| Privileges | `CAP_SYS_ADMIN` in user namespace | Available with `unshare -m` |
+| SELinux instead of AppArmor | **Does not work** | SELinux implements `security_sb_kern_mount()` |
+| Container runtime | Depends on seccomp filter | Docker default seccomp blocks `fsopen` — Podman/LXC may not |
+
+### Quick Reference: What Blocks Each Finding
+
+| Environment | LID-001 | LID-002 | LID-003 |
+|:---|:---|:---|:---|
+| Ubuntu 22.04+ (AppArmor, default) | **Works** | **Works** | **Works** |
+| Debian 12+ (AppArmor) | **Works** | **Works** | **Works** |
+| RHEL/Fedora (SELinux) | No | **Works** | No |
+| `lockdown=confidentiality` | No | **Works** | **Works** |
+| Unprivileged user | No | **Works** | Depends on user ns |
+| Container (no CAP_BPF) | No | Depends on io_uring | Depends on seccomp |
+
+<br>
+
 ## Findings
 
 | ID | Vector | Target | What Happens |
@@ -312,12 +399,13 @@ For detailed mitigation guidance, see [`docs/RESEARCH.md`](docs/RESEARCH.md).
 
 ## Requirements
 
-| Requirement | Details |
-|:---|:---|
-| Kernel | 5.x+ with BPF support (LID-001), 5.18+ (LID-002) |
-| Config | `CONFIG_BPF_KPROBE_OVERRIDE=y` for LID-001 |
-| Privileges | Root or `CAP_BPF` + `CAP_PERFMON` (LID-001), unprivileged (LID-002) |
-| Target | AppArmor (LID-001, LID-003), any LSM (LID-002) |
+See the [Reproducibility Matrix](#reproducibility-matrix) for full per-finding details. Summary:
+
+| Finding | Min Kernel | Privileges | Target LSM |
+|:---|:---|:---|:---|
+| LID-001 | 5.x+ | root / CAP_BPF+CAP_PERFMON | AppArmor only |
+| LID-002 | 6.0+ | **None** | Any (SELinux, AppArmor, Smack) |
+| LID-003 | 5.2+ | CAP_SYS_ADMIN (user ns ok) | AppArmor only |
 
 <br>
 
