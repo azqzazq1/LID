@@ -135,14 +135,27 @@ static int __dev_queue_xmit(struct sk_buff *skb, ...)
 
 | CNI / Policy Engine | Enforcement Method | Bypassed? | Verified? |
 |:---|:---|:---|:---|
-| tc u32/flower filters | tc egress classifiers | **YES** | **Dynamically verified** |
+| tc u32/flower filters | tc egress classifiers on container eth0 | **YES** | **Dynamically verified** |
 | tc-based rate limiting | tc qdisc + classifiers | **YES** | **Dynamically verified** |
-| Cilium | eBPF on tc egress | Theoretical — likely on egress side | **NOT TESTED with real Cilium** |
-| Calico (eBPF mode) | eBPF on tc egress | Theoretical — likely on egress side | **NOT TESTED with real Calico** |
-| Calico (iptables mode) | iptables OUTPUT/FORWARD | Unknown — bridge iptables may catch it | **NOT TESTED** |
-| Kubernetes NetworkPolicy | Depends on CNI implementation | Depends on CNI | **NOT TESTED** |
+| Cilium (v1.19) | tcx/ingress BPF on node-side veth peer | **NO** | **Tested — Cilium catches it** |
+| Kubernetes NetworkPolicy (Cilium) | Cilium BPF + source IP verification | **NO** | **Tested — dropped as "Invalid source ip"** |
+| Calico (eBPF mode) | Unknown | Unknown | **NOT TESTED** |
+| Calico (iptables mode) | iptables on bridge | Unknown | **NOT TESTED** |
 
-**Important caveat:** The tc egress bypass is verified with u32 classifiers. However, CNIs like Cilium may enforce policy at **multiple points** — including host-side veth ingress, XDP on host interfaces, or iptables on the bridge. A real Cilium/Calico bypass requires testing in an actual Kubernetes cluster with those CNIs deployed. The claim is based on code path analysis (`__dev_direct_xmit` skips `sch_handle_egress`), not end-to-end CNI testing.
+### Cilium Test Results (kind + Cilium v1.19.1, deny-all egress NetworkPolicy)
+
+Cilium enforces policy on the **node-side veth peer ingress** (`cil_from_container` BPF program via tcx/ingress on `lxc*` interface), NOT on the container's eth0 egress. AF_XDP bypasses the container eth0 egress path, but Cilium's BPF runs **after** the packet arrives at the node-side veth — a point AF_XDP cannot bypass.
+
+```
+Cilium monitor output:
+  xx drop (Invalid source ip) flow 0x0 to endpoint 0, ifindex 9,
+     file bpf_lxc.c:1603, identity 57299->unknown:
+     10.0.0.99:31337 -> 10.255.255.1:9999 udp
+```
+
+Additionally, Cilium has **SourceIPVerification: Enabled** by default, which drops any packet whose source IP doesn't match the pod's assigned IP — defeating IP spoofing regardless of egress policy.
+
+**Conclusion:** Cilium's architecture (enforcement on node-side ingress + source IP verification) is robust against AF_XDP tc egress bypass. The bypass only defeats enforcement mechanisms that rely solely on tc egress classifiers attached to the container's interface.
 
 ### IP and MAC Spoofing (Verified)
 

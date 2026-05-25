@@ -80,7 +80,7 @@ The real-world exploitability question:
 | **LID-002** | **High** — `security_file_receive()` never fires, fd transfer invisible to all LSMs | **High** — works from **unprivileged** userspace via io_uring. Crosses LSM enforcement boundary without any privilege. |
 | **LID-003** | **High** — `security_sb_mount()` bypassed, AppArmor mount policy is dead code | **Medium** — requires mount namespace access (CAP_SYS_ADMIN in user ns). Available in many container configs. |
 | **LID-004** | **Critical** — AppArmor sees nothing, zero BPF hooks (0/9), no audit trace for any BPF token operation | **Medium** — requires bpffs delegation by host + CAP_BPF in user namespace. Available in container runtimes with BPF delegation (LXD/Incus). |
-| **LID-009** | **High** — tc egress classifiers never evaluate AF_XDP traffic, flow accounting blind | **High** — works from **default Docker container** (CAP_NET_RAW only). Bypasses tc egress (verified). CNI bypass (Cilium/Calico) theoretical — untested with real deployments. IP/MAC spoofing verified. |
+| **LID-009** | **Medium** — tc egress classifiers on container interface never evaluate AF_XDP traffic | **Limited** — bypasses tc egress on container eth0 (verified). **Cilium NOT bypassed** — enforces on node-side veth ingress + source IP verification (tested). Impact limited to plain-Docker setups with tc-only egress filtering. |
 
 <br>
 
@@ -349,7 +349,9 @@ On Ubuntu/Debian, a container with bpffs delegation can:
 
 ## LID-009: AF_XDP tc Egress Bypass from Default Docker Container
 
-AF_XDP's copy-mode transmit path (`xsk_generic_xmit` → `__dev_direct_xmit`) **bypasses tc egress classifiers** on the container's interface. Verified with tc u32 DROP-ALL — AF_PACKET blocked, AF_XDP passes. CNI-level impact (Cilium/Calico) is theoretical based on code path analysis and **not tested with real CNI deployments**. Only CAP_NET_RAW is needed (default in Docker).
+AF_XDP's copy-mode transmit path (`xsk_generic_xmit` → `__dev_direct_xmit`) **bypasses tc egress classifiers** on the container's interface. Verified with tc u32 DROP-ALL — AF_PACKET blocked, AF_XDP passes.
+
+**However:** Tested with Cilium v1.19 (kind cluster, deny-all egress NetworkPolicy) — **Cilium was NOT bypassed.** Cilium enforces on the node-side veth peer ingress (`cil_from_container` via tcx/ingress) + has source IP verification. AF_XDP packets were dropped as "Invalid source ip" at `bpf_lxc.c:1603`. Impact is limited to environments relying solely on tc egress classifiers for network policy (plain Docker + tc rules, no CNI).
 
 ```
   Normal TX path:
