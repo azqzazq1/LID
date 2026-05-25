@@ -7,11 +7,14 @@
 
 ## Summary
 
-AF_XDP sockets can be created, set up, bound, and used for raw packet transmission from a **default Docker container** with zero additional capabilities beyond the default set. The transmission path (`xsk_generic_xmit` → `__dev_direct_xmit`) bypasses the entire tc egress pipeline, including:
+AF_XDP sockets can be created, set up, bound, and used for raw packet transmission from a **default Docker container** with zero additional capabilities beyond the default set. The transmission path (`xsk_generic_xmit` → `__dev_direct_xmit`) bypasses the tc egress pipeline on the container's interface. Verified bypass:
 
-- tc classifiers (u32, flower, BPF)
-- eBPF programs attached as tc egress (e.g., Cilium, Calico)
-- qdisc processing (traffic shaping, rate limiting)
+- tc classifiers (u32, flower) — **dynamically verified**
+- qdisc processing (traffic shaping, rate limiting) — **verified**
+
+Theoretical bypass (code path analysis, NOT tested with real deployments):
+
+- eBPF programs attached as tc egress (Cilium, Calico may have additional enforcement points)
 
 Packets transmitted via AF_XDP carry **attacker-controlled Ethernet headers** (spoofed MAC, spoofed IP), and reach the Docker bridge despite tc DROP-ALL rules that block identical AF_PACKET traffic.
 
@@ -130,21 +133,23 @@ static int __dev_queue_xmit(struct sk_buff *skb, ...)
 
 ### Container Network Policy Bypass
 
-| CNI / Policy Engine | Enforcement Method | Bypassed? |
-|:---|:---|:---|
-| Cilium | eBPF on tc egress | **YES** |
-| Calico (eBPF mode) | eBPF on tc egress | **YES** |
-| Calico (iptables mode) | iptables OUTPUT/FORWARD | Partial — iptables on bridge may still see it |
-| tc-based rate limiting | tc qdisc + classifiers | **YES** |
-| Custom tc filters | u32, flower, BPF | **YES** |
-| Kubernetes NetworkPolicy | Depends on CNI implementation | **YES** (if tc-based) |
+| CNI / Policy Engine | Enforcement Method | Bypassed? | Verified? |
+|:---|:---|:---|:---|
+| tc u32/flower filters | tc egress classifiers | **YES** | **Dynamically verified** |
+| tc-based rate limiting | tc qdisc + classifiers | **YES** | **Dynamically verified** |
+| Cilium | eBPF on tc egress | Theoretical — likely on egress side | **NOT TESTED with real Cilium** |
+| Calico (eBPF mode) | eBPF on tc egress | Theoretical — likely on egress side | **NOT TESTED with real Calico** |
+| Calico (iptables mode) | iptables OUTPUT/FORWARD | Unknown — bridge iptables may catch it | **NOT TESTED** |
+| Kubernetes NetworkPolicy | Depends on CNI implementation | Depends on CNI | **NOT TESTED** |
 
-### IP and MAC Spoofing
+**Important caveat:** The tc egress bypass is verified with u32 classifiers. However, CNIs like Cilium may enforce policy at **multiple points** — including host-side veth ingress, XDP on host interfaces, or iptables on the bridge. A real Cilium/Calico bypass requires testing in an actual Kubernetes cluster with those CNIs deployed. The claim is based on code path analysis (`__dev_direct_xmit` skips `sch_handle_egress`), not end-to-end CNI testing.
+
+### IP and MAC Spoofing (Verified)
 
 - Container can send packets with **any source MAC address** (not just its assigned veth MAC)
 - Container can send packets with **any source IP** (not just its container IP)
 - Enables ARP spoofing, DHCP spoofing, and cross-container attacks on the same bridge
-- Spoofed packets bypass container identity tracking (e.g., Cilium's endpoint identity)
+- Whether spoofed packets bypass container identity tracking depends on where the CNI checks identity
 
 ### No Audit Trail
 
