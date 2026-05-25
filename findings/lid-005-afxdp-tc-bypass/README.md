@@ -1,4 +1,4 @@
-# LID-009: AF_XDP `__dev_direct_xmit()` Bypasses tc Egress from Default Docker Container
+# LID-005: AF_XDP `__dev_direct_xmit()` Bypasses tc Egress from Default Docker Container
 
 **Vector:** AF_XDP copy-mode TX bypasses tc egress classifiers (eBPF, u32, etc.)
 **Target:** Linux kernel `__dev_direct_xmit()` path, all tc-based container network policies

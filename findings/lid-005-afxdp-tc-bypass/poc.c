@@ -1,5 +1,5 @@
 /*
- * LID-009 PoC: AF_XDP tc Egress Bypass from Default Docker Container
+ * LID-005 PoC: AF_XDP tc Egress Bypass from Default Docker Container
  *
  * Demonstrates that AF_XDP copy-mode TX bypasses tc egress classifiers,
  * allowing raw packet injection with spoofed MAC/IP from a container
@@ -47,7 +47,7 @@ int main(int argc, char **argv)
 {
     const char *ifname = argc > 1 ? argv[1] : "eth0";
 
-    printf("=== LID-009: AF_XDP tc Egress Bypass PoC ===\n");
+    printf("=== LID-005: AF_XDP tc Egress Bypass PoC ===\n");
     printf("Target: %s | PID: %d | UID: %d\n\n", ifname, getpid(), getuid());
 
     /* 1. Create AF_XDP socket (CAP_NET_RAW only) */

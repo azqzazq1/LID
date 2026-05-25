@@ -80,7 +80,7 @@ The real-world exploitability question:
 | **LID-002** | **High** — `security_file_receive()` never fires, fd transfer invisible to all LSMs | **High** — works from **unprivileged** userspace via io_uring. Crosses LSM enforcement boundary without any privilege. |
 | **LID-003** | **High** — `security_sb_mount()` bypassed, AppArmor mount policy is dead code | **Medium** — requires mount namespace access (CAP_SYS_ADMIN in user ns). Available in many container configs. |
 | **LID-004** | **Critical** — AppArmor sees nothing, zero BPF hooks (0/9), no audit trace for any BPF token operation | **Medium** — requires bpffs delegation by host + CAP_BPF in user namespace. Available in container runtimes with BPF delegation (LXD/Incus). |
-| **LID-009** | **Medium** — tc egress classifiers on container interface never evaluate AF_XDP traffic | **Limited** — bypasses tc egress on container eth0 (verified). **Cilium NOT bypassed** — enforces on node-side veth ingress + source IP verification (tested). Impact limited to plain-Docker setups with tc-only egress filtering. |
+| **LID-005** | **Medium** — tc egress classifiers on container interface never evaluate AF_XDP traffic | **Limited** — bypasses tc egress on container eth0 (verified). **Cilium NOT bypassed** — enforces on node-side veth ingress + source IP verification (tested). Impact limited to plain-Docker setups with tc-only egress filtering. |
 
 <br>
 
@@ -135,7 +135,7 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 | SELinux instead of AppArmor | **Does not work** | SELinux implements `security_sb_kern_mount()` |
 | Container runtime | Depends on seccomp filter | Docker default seccomp blocks `fsopen` — Podman/LXC may not |
 
-### LID-009: AF_XDP tc Egress Bypass
+### LID-005: AF_XDP tc Egress Bypass
 
 | Condition | Required | Notes |
 |:---|:---|:---|
@@ -147,7 +147,7 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 
 ### Quick Reference: What Blocks Each Finding
 
-| Environment | LID-001 | LID-002 | LID-003 | LID-004 | LID-009 |
+| Environment | LID-001 | LID-002 | LID-003 | LID-004 | LID-005 |
 |:---|:---|:---|:---|:---|:---|
 | Ubuntu 22.04+ (AppArmor, default) | **Works** | **Works** | **Works** | **Works** (6.9+) | **Works** |
 | Debian 12+ (AppArmor) | **Works** | **Works** | **Works** | **Works** (6.9+) | **Works** |
@@ -167,7 +167,7 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 | [**LID-002**](findings/lid-002-iouring-msgring/) | io_uring MSG_RING SEND_FD | SELinux, AppArmor, Smack | fd transfer skips `security_file_receive()` — every other fd transfer calls it |
 | [**LID-003**](findings/lid-003-mount-api/) | New mount API (fsopen/fsmount) | AppArmor | `security_sb_mount()` never called — AppArmor's only mount hook bypassed |
 | [**LID-004**](findings/lid-004-bpf-token/) | BPF token delegation | AppArmor, Smack | Zero BPF hooks — token creation, usage, capability delegation completely invisible |
-| [**LID-009**](findings/lid-009-afxdp-tc-bypass/) | AF_XDP `__dev_direct_xmit` | tc egress, Cilium, Calico | Copy-mode TX from default Docker bypasses tc classifiers — spoofed packets reach bridge |
+| [**LID-005**](findings/lid-005-afxdp-tc-bypass/) | AF_XDP `__dev_direct_xmit` | tc egress, Cilium, Calico | Copy-mode TX from default Docker bypasses tc classifiers — spoofed packets reach bridge |
 
 <br>
 
@@ -347,7 +347,7 @@ On Ubuntu/Debian, a container with bpffs delegation can:
 
 ---
 
-## LID-009: AF_XDP tc Egress Bypass from Default Docker Container
+## LID-005: AF_XDP tc Egress Bypass from Default Docker Container
 
 AF_XDP's copy-mode transmit path (`xsk_generic_xmit` → `__dev_direct_xmit`) **bypasses tc egress classifiers** on the container's interface. Verified with tc u32 DROP-ALL — AF_PACKET blocked, AF_XDP passes.
 
@@ -376,7 +376,7 @@ tc egress DROP-ALL on container eth0:
 
 Packets carry attacker-controlled Ethernet headers — spoofed MAC, spoofed IP — and reach the Docker bridge despite active DROP policy.
 
-**PoC + details:** [`findings/lid-009-afxdp-tc-bypass/`](findings/lid-009-afxdp-tc-bypass/)
+**PoC + details:** [`findings/lid-005-afxdp-tc-bypass/`](findings/lid-005-afxdp-tc-bypass/)
 
 <br>
 
@@ -441,7 +441,7 @@ LID/
 │   │   └── ADVISORY.md            # Technical advisory
 │   ├── lid-003-mount-api/         # New mount API AppArmor bypass
 │   ├── lid-004-bpf-token/        # BPF token AppArmor/Smack zero coverage
-│   └── lid-009-afxdp-tc-bypass/  # AF_XDP tc egress bypass from container
+│   └── lid-005-afxdp-tc-bypass/  # AF_XDP tc egress bypass from container
 ├── tests/
 │   └── test_reader.c              # Victim binary for LID-001 demo
 ├── scripts/
@@ -498,7 +498,7 @@ See the [Reproducibility Matrix](#reproducibility-matrix) for full per-finding d
 | LID-002 | 6.0+ | **None** | Any (SELinux, AppArmor, Smack) |
 | LID-003 | 5.2+ | CAP_SYS_ADMIN (user ns ok) | AppArmor only |
 | LID-004 | 6.9+ | CAP_BPF (user ns ok) | AppArmor, Smack |
-| LID-009 | 4.18+ | **CAP_NET_RAW (Docker default)** | tc egress (Cilium, Calico, etc.) |
+| LID-005 | 4.18+ | **CAP_NET_RAW (Docker default)** | tc egress (Cilium, Calico, etc.) |
 
 <br>
 
