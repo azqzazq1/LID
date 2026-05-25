@@ -21,7 +21,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Linux-5.18+-0078D4?style=for-the-badge&logo=linux&logoColor=white" />
   <img src="https://img.shields.io/badge/LSM-BYPASSED-DC3545?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/Findings-4_Vectors-F36D00?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Findings-5_Vectors-F36D00?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Audit_Log-INVISIBLE-000000?style=for-the-badge" />
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
   <a href="https://doi.org/10.5281/zenodo.20257645"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.20257645.svg" height="28" /></a>
@@ -80,6 +80,7 @@ The real-world exploitability question:
 | **LID-002** | **High** — `security_file_receive()` never fires, fd transfer invisible to all LSMs | **High** — works from **unprivileged** userspace via io_uring. Crosses LSM enforcement boundary without any privilege. |
 | **LID-003** | **High** — `security_sb_mount()` bypassed, AppArmor mount policy is dead code | **Medium** — requires mount namespace access (CAP_SYS_ADMIN in user ns). Available in many container configs. |
 | **LID-004** | **Critical** — AppArmor sees nothing, zero BPF hooks (0/9), no audit trace for any BPF token operation | **Medium** — requires bpffs delegation by host + CAP_BPF in user namespace. Available in container runtimes with BPF delegation (LXD/Incus). |
+| **LID-009** | **High** — tc egress classifiers never evaluate AF_XDP traffic, flow accounting blind | **High** — works from **default Docker container** (CAP_NET_RAW only). Bypasses Cilium/Calico network policies. IP/MAC spoofing. |
 
 <br>
 
@@ -134,16 +135,27 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 | SELinux instead of AppArmor | **Does not work** | SELinux implements `security_sb_kern_mount()` |
 | Container runtime | Depends on seccomp filter | Docker default seccomp blocks `fsopen` — Podman/LXC may not |
 
+### LID-009: AF_XDP tc Egress Bypass
+
+| Condition | Required | Notes |
+|:---|:---|:---|
+| Kernel version | 4.18+ | AF_XDP introduced in 4.18 |
+| `CONFIG_XDP_SOCKETS` | `=y` | Default on all major distros |
+| Privileges | **CAP_NET_RAW only** | Default in Docker, Kubernetes pods |
+| Container runtime | Docker, K8s, LXC | Default capability set |
+| tc-based network policy | Yes | Cilium eBPF, Calico, tc u32/flower |
+
 ### Quick Reference: What Blocks Each Finding
 
-| Environment | LID-001 | LID-002 | LID-003 | LID-004 |
-|:---|:---|:---|:---|:---|
-| Ubuntu 22.04+ (AppArmor, default) | **Works** | **Works** | **Works** | **Works** (6.9+) |
-| Debian 12+ (AppArmor) | **Works** | **Works** | **Works** | **Works** (6.9+) |
-| RHEL/Fedora (SELinux) | No | **Works** | No | No |
-| `lockdown=confidentiality` | No | **Works** | **Works** | Partially |
-| Unprivileged user | No | **Works** | Depends on user ns | Depends on bpffs delegation |
-| Container (no CAP_BPF) | No | Depends on io_uring | Depends on seccomp | No |
+| Environment | LID-001 | LID-002 | LID-003 | LID-004 | LID-009 |
+|:---|:---|:---|:---|:---|:---|
+| Ubuntu 22.04+ (AppArmor, default) | **Works** | **Works** | **Works** | **Works** (6.9+) | **Works** |
+| Debian 12+ (AppArmor) | **Works** | **Works** | **Works** | **Works** (6.9+) | **Works** |
+| RHEL/Fedora (SELinux) | No | **Works** | No | No | **Works** |
+| `lockdown=confidentiality` | No | **Works** | **Works** | Partially | **Works** |
+| Unprivileged user | No | **Works** | Depends on user ns | Depends on bpffs delegation | No |
+| Container (no CAP_BPF) | No | Depends on io_uring | Depends on seccomp | No | **Works** |
+| Container (CAP_NET_RAW dropped) | No | Depends | Depends | No | No |
 
 <br>
 
@@ -155,6 +167,7 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 | [**LID-002**](findings/lid-002-iouring-msgring/) | io_uring MSG_RING SEND_FD | SELinux, AppArmor, Smack | fd transfer skips `security_file_receive()` — every other fd transfer calls it |
 | [**LID-003**](findings/lid-003-mount-api/) | New mount API (fsopen/fsmount) | AppArmor | `security_sb_mount()` never called — AppArmor's only mount hook bypassed |
 | [**LID-004**](findings/lid-004-bpf-token/) | BPF token delegation | AppArmor, Smack | Zero BPF hooks — token creation, usage, capability delegation completely invisible |
+| [**LID-009**](findings/lid-009-afxdp-tc-bypass/) | AF_XDP `__dev_direct_xmit` | tc egress, Cilium, Calico | Copy-mode TX from default Docker bypasses tc classifiers — spoofed packets reach bridge |
 
 <br>
 
@@ -334,6 +347,39 @@ On Ubuntu/Debian, a container with bpffs delegation can:
 
 ---
 
+## LID-009: AF_XDP tc Egress Bypass from Default Docker Container
+
+AF_XDP's copy-mode transmit path (`xsk_generic_xmit` → `__dev_direct_xmit`) **bypasses the entire tc egress pipeline** — including eBPF classifiers used by Cilium and Calico for container network policy. Only CAP_NET_RAW is needed (default in Docker).
+
+```
+  Normal TX path:
+  socket → dev_queue_xmit() → sch_handle_egress() → tc classifiers → driver
+                                     ↑
+                                  ENFORCED (Cilium eBPF, Calico, tc u32)
+
+  AF_XDP copy-mode TX:
+  xsk_sendmsg() → xsk_generic_xmit() → __dev_direct_xmit() → driver
+                                              ↑
+                                           SKIPPED (tc never runs)
+```
+
+**Dynamically verified on kernel 6.8.0 with Docker default containers:**
+
+```
+tc egress DROP-ALL on container eth0:
+
+  AF_PACKET sendto → ENOBUFS (BLOCKED by tc)
+  AF_XDP    sendto → 0       (BYPASS — 3 spoofed packets reached docker0 bridge)
+```
+
+Packets carry attacker-controlled Ethernet headers — spoofed MAC, spoofed IP — and reach the Docker bridge despite active DROP policy.
+
+**PoC + details:** [`findings/lid-009-afxdp-tc-bypass/`](findings/lid-009-afxdp-tc-bypass/)
+
+<br>
+
+---
+
 ## Architecture: Why BPF LSM Can't Fix This
 
 ```
@@ -392,7 +438,8 @@ LID/
 │   │   ├── msg_ring_bypass.c      # PoC with ftrace verification
 │   │   └── ADVISORY.md            # Technical advisory
 │   ├── lid-003-mount-api/         # New mount API AppArmor bypass
-│   └── lid-004-bpf-token/        # BPF token AppArmor/Smack zero coverage
+│   ├── lid-004-bpf-token/        # BPF token AppArmor/Smack zero coverage
+│   └── lid-009-afxdp-tc-bypass/  # AF_XDP tc egress bypass from container
 ├── tests/
 │   └── test_reader.c              # Victim binary for LID-001 demo
 ├── scripts/
@@ -443,12 +490,13 @@ For detailed mitigation guidance, see [`docs/RESEARCH.md`](docs/RESEARCH.md).
 
 See the [Reproducibility Matrix](#reproducibility-matrix) for full per-finding details. Summary:
 
-| Finding | Min Kernel | Privileges | Target LSM |
+| Finding | Min Kernel | Privileges | Target |
 |:---|:---|:---|:---|
 | LID-001 | 5.x+ | root / CAP_BPF+CAP_PERFMON | AppArmor only |
 | LID-002 | 6.0+ | **None** | Any (SELinux, AppArmor, Smack) |
 | LID-003 | 5.2+ | CAP_SYS_ADMIN (user ns ok) | AppArmor only |
 | LID-004 | 6.9+ | CAP_BPF (user ns ok) | AppArmor, Smack |
+| LID-009 | 4.18+ | **CAP_NET_RAW (Docker default)** | tc egress (Cilium, Calico, etc.) |
 
 <br>
 
