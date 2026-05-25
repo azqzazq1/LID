@@ -21,7 +21,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Linux-5.18+-0078D4?style=for-the-badge&logo=linux&logoColor=white" />
   <img src="https://img.shields.io/badge/LSM-BYPASSED-DC3545?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/Findings-3_Vectors-F36D00?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Findings-4_Vectors-F36D00?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Audit_Log-INVISIBLE-000000?style=for-the-badge" />
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
   <a href="https://doi.org/10.5281/zenodo.20257645"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.20257645.svg" height="28" /></a>
@@ -79,6 +79,7 @@ The real-world exploitability question:
 | **LID-001** | **Critical** — AppArmor sees nothing, audit log empty, zero forensic trace | **Limited** — requires root or CAP_BPF+CAP_PERFMON (already privileged). Not a privilege escalation. Impact: policy evasion + audit blindness. |
 | **LID-002** | **High** — `security_file_receive()` never fires, fd transfer invisible to all LSMs | **High** — works from **unprivileged** userspace via io_uring. Crosses LSM enforcement boundary without any privilege. |
 | **LID-003** | **High** — `security_sb_mount()` bypassed, AppArmor mount policy is dead code | **Medium** — requires mount namespace access (CAP_SYS_ADMIN in user ns). Available in many container configs. |
+| **LID-004** | **Critical** — AppArmor sees nothing, zero BPF hooks (0/9), no audit trace for any BPF token operation | **Medium** — requires bpffs delegation by host + CAP_BPF in user namespace. Available in container runtimes with BPF delegation (LXD/Incus). |
 
 <br>
 
@@ -112,6 +113,17 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 | Target LSM | Any (SELinux, AppArmor, Smack) | `security_file_receive()` is a generic LSM hook |
 | `kernel.lockdown` | Irrelevant | No BPF involved |
 
+### LID-004: BPF Token AppArmor Blindness
+
+| Condition | Required | Notes |
+|:---|:---|:---|
+| Kernel version | 6.9+ | BPF token introduced in 6.9 |
+| `CONFIG_BPF_SYSCALL` | `=y` | Default on all major distros |
+| `CONFIG_SECURITY_APPARMOR` | `=y` | Ubuntu/Debian default |
+| bpffs with delegation | Yes | Host must mount with `delegate_*` options |
+| Privileges | CAP_BPF in user namespace | Trivially available to userns root |
+| SELinux instead of AppArmor | **Not affected** | SELinux implements all 9 BPF hooks |
+
 ### LID-003: New Mount API
 
 | Condition | Required | Notes |
@@ -124,14 +136,14 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 
 ### Quick Reference: What Blocks Each Finding
 
-| Environment | LID-001 | LID-002 | LID-003 |
-|:---|:---|:---|:---|
-| Ubuntu 22.04+ (AppArmor, default) | **Works** | **Works** | **Works** |
-| Debian 12+ (AppArmor) | **Works** | **Works** | **Works** |
-| RHEL/Fedora (SELinux) | No | **Works** | No |
-| `lockdown=confidentiality` | No | **Works** | **Works** |
-| Unprivileged user | No | **Works** | Depends on user ns |
-| Container (no CAP_BPF) | No | Depends on io_uring | Depends on seccomp |
+| Environment | LID-001 | LID-002 | LID-003 | LID-004 |
+|:---|:---|:---|:---|:---|
+| Ubuntu 22.04+ (AppArmor, default) | **Works** | **Works** | **Works** | **Works** (6.9+) |
+| Debian 12+ (AppArmor) | **Works** | **Works** | **Works** | **Works** (6.9+) |
+| RHEL/Fedora (SELinux) | No | **Works** | No | No |
+| `lockdown=confidentiality` | No | **Works** | **Works** | Partially |
+| Unprivileged user | No | **Works** | Depends on user ns | Depends on bpffs delegation |
+| Container (no CAP_BPF) | No | Depends on io_uring | Depends on seccomp | No |
 
 <br>
 
@@ -142,6 +154,7 @@ Each finding has specific kernel/config/privilege requirements. **If your enviro
 | [**LID-001**](findings/lid-001-ebpf-pathname/) | eBPF kprobe pathname rewriting | AppArmor | kprobe rewrites filename before `copy_from_user` → AppArmor checks wrong path |
 | [**LID-002**](findings/lid-002-iouring-msgring/) | io_uring MSG_RING SEND_FD | SELinux, AppArmor, Smack | fd transfer skips `security_file_receive()` — every other fd transfer calls it |
 | [**LID-003**](findings/lid-003-mount-api/) | New mount API (fsopen/fsmount) | AppArmor | `security_sb_mount()` never called — AppArmor's only mount hook bypassed |
+| [**LID-004**](findings/lid-004-bpf-token/) | BPF token delegation | AppArmor, Smack | Zero BPF hooks — token creation, usage, capability delegation completely invisible |
 
 <br>
 
@@ -293,6 +306,34 @@ Additional gaps found:
 
 ---
 
+## LID-004: BPF Token — AppArmor Zero Coverage
+
+The BPF token subsystem (Linux 6.9+) delegates BPF capabilities to unprivileged processes in user namespaces. The kernel defines **9 BPF LSM hooks**. SELinux implements all 9 with real `avc_has_perm()` enforcement. AppArmor implements **zero**.
+
+```
+  Kernel defines 9 BPF LSM hooks:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  bpf, bpf_map, bpf_prog, bpf_map_create, bpf_prog_load,      │
+  │  bpf_token_create, bpf_token_free, bpf_token_cmd,             │
+  │  bpf_token_capable                                             │
+  └─────────────────────────────────────────────────────────────────┘
+
+  SELinux:   ████████████████████████████  9/9 implemented
+  AppArmor:                                0/9 implemented
+  Smack:                                   0/9 implemented
+```
+
+On Ubuntu/Debian, a container with bpffs delegation can:
+- Create BPF tokens → AppArmor sees nothing
+- Use tokens to load tracing programs → AppArmor sees nothing
+- Delegate CAP_PERFMON → disable Spectre mitigations → AppArmor sees nothing
+
+**Details:** [`findings/lid-004-bpf-token/`](findings/lid-004-bpf-token/)
+
+<br>
+
+---
+
 ## Architecture: Why BPF LSM Can't Fix This
 
 ```
@@ -350,7 +391,8 @@ LID/
 │   ├── lid-002-iouring-msgring/   # io_uring MSG_RING missing LSM hook
 │   │   ├── msg_ring_bypass.c      # PoC with ftrace verification
 │   │   └── ADVISORY.md            # Technical advisory
-│   └── lid-003-mount-api/         # New mount API AppArmor bypass
+│   ├── lid-003-mount-api/         # New mount API AppArmor bypass
+│   └── lid-004-bpf-token/        # BPF token AppArmor/Smack zero coverage
 ├── tests/
 │   └── test_reader.c              # Victim binary for LID-001 demo
 ├── scripts/
@@ -406,6 +448,7 @@ See the [Reproducibility Matrix](#reproducibility-matrix) for full per-finding d
 | LID-001 | 5.x+ | root / CAP_BPF+CAP_PERFMON | AppArmor only |
 | LID-002 | 6.0+ | **None** | Any (SELinux, AppArmor, Smack) |
 | LID-003 | 5.2+ | CAP_SYS_ADMIN (user ns ok) | AppArmor only |
+| LID-004 | 6.9+ | CAP_BPF (user ns ok) | AppArmor, Smack |
 
 <br>
 
